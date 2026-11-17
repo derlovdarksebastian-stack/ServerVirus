@@ -2,67 +2,67 @@ import os
 import sys
 import json
 import logging
+import threading
+import websockets.legacy.server
 from pymongo import MongoClient
 from cloudlink import cloudlink
 
-# 1. Conectar a MongoDB Atlas
+# 1. Conectar a MongoDB Atlas y probar conexión al arrancar
 mongo_uri = os.environ.get("MONGO_URI")
-cliente_mongo = MongoClient(mongo_uri)
+cliente_mongo = MongoClient(mongo_uri, serverSelectionTimeoutMS=5000)
 db = cliente_mongo["JuegoVirusDB"]
 coleccion_jugadores = db["estado_jugadores"]
 
-# Memoria caché para evitar guardar datos repetidos en la base de datos
+try:
+    cliente_mongo.admin.command("ping")
+    print("[OK] CONEXION EXITOSA A MONGODB ATLAS!", flush=True)
+except Exception as e:
+    print(f"[ERROR CRITICO MONGO] {e}", flush=True)
+
 cache_estados = {}
 
-# 2. Procesar el array [317, 331, "User"] en tiempo real
-def procesar_movimiento(mensaje_crudo):
+def guardar_en_mongo(usuario, cartas):
     try:
-        json_str = mensaje_crudo.split("< TEXT ", 1).strip("'")
-        paquete = json.loads(json_str)
-        
-        if paquete.get("cmd") in ["gmsg", "gvar"]:
-            contenido = paquete.get("val")
-            
-            # Si llega como texto JSON "[317,331,'User']", convertirlo a lista de Python
-            if isinstance(contenido, str) and contenido.startswith("["):
-                contenido = json.loads(contenido)
-                
-            # Verificar que sea un array con al menos 1 dato y el username al final
-            if isinstance(contenido, list) and len(contenido) >= 2:
-                usuario = str(contenido[-1])   # Extrae "User" (último elemento)
-                cartas = contenido[:-1]        # Extrae [317, 331] (todos los anteriores)
-                
-                # Solo escribir en MongoDB si el estado de las cartas cambió
-                if cache_estados.get(usuario) != cartas:
-                    cache_estados[usuario] = cartas
-                    coleccion_jugadores.update_one(
-                        {"usuario": usuario},
-                        {"$set": {"usuario": usuario, "cartas": cartas}},
-                        upsert=True
-                    )
-                    print(f"[DB ACTUALIZADA] {usuario} -> {cartas}", flush=True)
-    except Exception:
-        pass
+        coleccion_jugadores.update_one(
+            {"usuario": usuario},
+            {"$set": {"usuario": usuario, "cartas": cartas}},
+            upsert=True
+        )
+        print(f"[DB ACTUALIZADA] {usuario} -> {cartas}", flush=True)
+    except Exception as e:
+        print(f"[ERROR GUARDANDO] {e}", flush=True)
 
-# 3. Filtro limpio de logs + disparador de guardado
-class LogYBaseDeDatos(logging.Filter):
-    def filter(self, record):
-        mensaje = record.getMessage()
-        if "< TEXT" in mensaje:
-            procesar_movimiento(mensaje)
-            return True
-        return "> TEXT" in mensaje or "connection open" in mensaje or "connection closed" in mensaje
+# 2. Interceptar mensajes entrantes directamente en WebSockets (100% confiable)
+recv_original = websockets.legacy.server.WebSocketServerProtocol.recv
 
-handler = logging.StreamHandler(sys.stdout)
-handler.addFilter(LogYBaseDeDatos())
-handler.setFormatter(logging.Formatter("[%(asctime)s] %(message)s", datefmt="%H:%M:%S"))
+async def recv_con_db(self):
+    mensaje = await recv_original(self)
+    if isinstance(mensaje, str):
+        print(f"[RECIBIDO] {mensaje}", flush=True)
+        try:
+            paquete = json.loads(mensaje)
+            if paquete.get("cmd") in ["gmsg", "gvar"]:
+                contenido = str(paquete.get("val", "")).strip()
+                if contenido.startswith("[") and contenido.endswith("]"):
+                    elementos = [x.strip().strip('"').strip("'") for x in contenido[1:-1].split(",") if x.strip()]
+                    if len(elementos) >= 2:
+                        usuario = elementos[-1]
+                        cartas = [int(c) if c.isdigit() else c for c in elementos[:-1]]
+                        if cache_estados.get(usuario) != cartas:
+                            cache_estados[usuario] = cartas
+                            threading.Thread(target=guardar_en_mongo, args=(usuario, cartas)).start()
+        except Exception as e:
+            print(f"[ERROR PARSE] {e}", flush=True)
+    return mensaje
 
-logging.basicConfig(level=logging.DEBUG, handlers=[handler], force=True)
+websockets.legacy.server.WebSocketServerProtocol.recv = recv_con_db
+
+# 3. Silenciar el ruido HTTP de Render y arrancar CloudLink
+logging.basicConfig(level=logging.ERROR, stream=sys.stdout, force=True)
 
 cl = cloudlink()
-server = cl.server(logs=True)
-server.suppressed_logs = []
+server = cl.server(logs=False)
 
 puerto = int(os.environ.get("PORT", 8080))
-print(f"=== SERVIDOR Y MONGODB LISTOS EN PUERTO {puerto} ===", flush=True)
+print(f"=== SERVIDOR LISTO EN PUERTO {puerto} ===", flush=True)
 server.run(ip="0.0.0.0", port=puerto)
