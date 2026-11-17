@@ -1,10 +1,8 @@
 import os
-from cloudlink import server
-from cloudlink.server.protocols import clpv4
+from cloudlink import cloudlink
 
-srv = server()
-srv.logging.basicConfig(level=srv.logging.DEBUG)
-protocolo = clpv4(srv)
+cl = cloudlink()
+server = cl.server(logs=True)
 
 puerto = int(os.environ.get("PORT", 8080))
-srv.run(ip="0.0.0.0", port=puerto)
+server.run(ip="0.0.0.0", port=puerto)
