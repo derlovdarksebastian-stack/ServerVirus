@@ -57,8 +57,8 @@ def enviar_db_a_turbowarp(ws_cliente, loop, filtro_usuario=None):
             if u and c_list:
                 cache_estados[u] = c_list
                 c_str = ",".join(str(c) for c in c_list)
-                lista_paquetes.append(f"[{c_str},{u}]")
-
+                lista_paquetes.append(f'[{c_str},"{u}"]')
+                
         if lista_paquetes:
             respuesta_unificada = "DB_ALL|" + "|".join(lista_paquetes)
         else:
