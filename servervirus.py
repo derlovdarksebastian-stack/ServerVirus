@@ -60,7 +60,7 @@ def rotar_turno(quien_pasa, jugador_forzado, loop):
             if not todos:
                 siguiente = quien_pasa or "LIBRE"
             elif len(todos) == 1:
-                siguiente = todos
+                siguiente = todos[0]
             else:
                 info = coleccion_partida.find_one({"_id": "partida_actual"})
                 actual = info.get("turno") if info else quien_pasa
@@ -68,7 +68,7 @@ def rotar_turno(quien_pasa, jugador_forzado, loop):
                     idx = (todos.index(actual) + 1) % len(todos)
                     siguiente = todos[idx]
                 else:
-                    siguiente = todos
+                    siguiente = todos[0]
 
         coleccion_partida.update_one(
             {"_id": "partida_actual"},
@@ -81,7 +81,6 @@ def rotar_turno(quien_pasa, jugador_forzado, loop):
     except Exception as e:
         print(f"[ERROR TURNO] {e}", flush=True)
 
-# Unifica cartas y turno en UN SOLO mensaje DB_ALL
 def enviar_db_a_turbowarp(ws_cliente, loop, filtro_usuario=None):
     try:
         consulta = {"usuario": filtro_usuario} if filtro_usuario else {}
@@ -90,7 +89,6 @@ def enviar_db_a_turbowarp(ws_cliente, loop, filtro_usuario=None):
         info_partida = coleccion_partida.find_one({"_id": "partida_actual"})
         turno_actual = info_partida.get("turno") if info_partida else "LIBRE"
         
-        # El bloque 2 siempre será el turno: TURNO:Derlo
         lista_paquetes = [f"TURNO:{turno_actual}"]
 
         for doc in documentos:
@@ -123,25 +121,30 @@ async def recv_con_db(self):
         try:
             paquete = json.loads(mensaje)
             cmd = paquete.get("cmd")
+            val = paquete.get("val")
             loop = asyncio.get_running_loop()
 
             if cmd == "setid":
-                usuarios_por_socket[self] = str(paquete.get("val", "")).strip()
+                usuarios_por_socket[self] = str(val).strip()
+                print(f"[CONECTADO] Usuario: {usuarios_por_socket[self]}", flush=True)
+
+            # Si el mensaje contiene "turno" en cualquier formato o comando, lo atrapa
+            elif val is not None and "turno" in str(val).lower():
+                contenido = str(val).strip()
+                print(f"[DETECTADO TURNO] cmd={cmd} | val={contenido}", flush=True)
+                forzado = contenido.split("|", 1)[1].strip() if "|" in contenido else None
+                remitente_user = usuarios_por_socket.get(self, "")
+                threading.Thread(target=rotar_turno, args=(remitente_user, forzado, loop)).start()
 
             elif cmd in ["gmsg", "gvar"]:
-                contenido = str(paquete.get("val", "")).strip()
+                contenido = str(val or "").strip()
 
                 if contenido == "GET_DB":
                     threading.Thread(target=enviar_db_a_turbowarp, args=(self, loop, None)).start()
 
                 elif contenido.startswith("GET|"):
-                    usuario_buscado = contenido.split("|", 1).strip()
+                    usuario_buscado = contenido.split("|", 1)[1].strip()
                     threading.Thread(target=enviar_db_a_turbowarp, args=(self, loop, usuario_buscado)).start()
-
-                elif contenido.lower().startswith("pasar turno") or contenido.upper().startswith("PASAR_TURNO"):
-                    forzado = contenido.split("|", 1).strip() if "|" in contenido else None
-                    remitente_user = usuarios_por_socket.get(self, "")
-                    threading.Thread(target=rotar_turno, args=(remitente_user, forzado, loop)).start()
 
                 elif contenido.startswith("[") and contenido.endswith("]"):
                     elementos = [x.strip().strip('"').strip("'") for x in contenido[1:-1].split(",") if x.strip()]
@@ -166,5 +169,5 @@ cl = cloudlink()
 server = cl.server(logs=False)
 
 puerto = int(os.environ.get("PORT", 8080))
-print(f"=== SERVIDOR UNIFICADO LISTO EN PUERTO {puerto} ===", flush=True)
+print(f"=== SERVIDOR LISTO EN PUERTO {puerto} ===", flush=True)
 server.run(ip="0.0.0.0", port=puerto)
