@@ -51,18 +51,16 @@ def guardar_y_retransmitir(remitente, usuario, cartas, texto_original, loop):
     except Exception as e:
         print(f"[ERROR GUARDANDO] {e}", flush=True)
 
-# Rotar el turno automáticamente entre los jugadores en MongoDB
 def rotar_turno(quien_pasa, jugador_forzado, loop):
     try:
         if jugador_forzado:
             siguiente = jugador_forzado
         else:
-            # Obtener todos los usuarios registrados en MongoDB
             todos = [doc["usuario"] for doc in coleccion_jugadores.find({}) if doc.get("usuario")]
             if not todos:
                 siguiente = quien_pasa or "LIBRE"
             elif len(todos) == 1:
-                siguiente = todos[0]
+                siguiente = todos
             else:
                 info = coleccion_partida.find_one({"_id": "partida_actual"})
                 actual = info.get("turno") if info else quien_pasa
@@ -70,7 +68,7 @@ def rotar_turno(quien_pasa, jugador_forzado, loop):
                     idx = (todos.index(actual) + 1) % len(todos)
                     siguiente = todos[idx]
                 else:
-                    siguiente = todos[0]
+                    siguiente = todos
 
         coleccion_partida.update_one(
             {"_id": "partida_actual"},
@@ -83,11 +81,17 @@ def rotar_turno(quien_pasa, jugador_forzado, loop):
     except Exception as e:
         print(f"[ERROR TURNO] {e}", flush=True)
 
+# Unifica cartas y turno en UN SOLO mensaje DB_ALL
 def enviar_db_a_turbowarp(ws_cliente, loop, filtro_usuario=None):
     try:
         consulta = {"usuario": filtro_usuario} if filtro_usuario else {}
         documentos = list(coleccion_jugadores.find(consulta))
-        lista_paquetes = []
+        
+        info_partida = coleccion_partida.find_one({"_id": "partida_actual"})
+        turno_actual = info_partida.get("turno") if info_partida else "LIBRE"
+        
+        # El bloque 2 siempre será el turno: TURNO:Derlo
+        lista_paquetes = [f"TURNO:{turno_actual}"]
 
         for doc in documentos:
             u = doc.get("usuario", "")
@@ -97,15 +101,10 @@ def enviar_db_a_turbowarp(ws_cliente, loop, filtro_usuario=None):
                 c_str = ",".join(str(c) for c in c_list)
                 lista_paquetes.append(f"[{c_str},{u}]")
 
-        respuesta_unificada = "DB_ALL|" + "|".join(lista_paquetes) if lista_paquetes else "DB_ALL|VACIO"
-        paquete_cartas = json.dumps({"cmd": "gmsg", "val": respuesta_unificada})
-        asyncio.run_coroutine_threadsafe(ws_cliente.send(paquete_cartas), loop)
-
-        info_partida = coleccion_partida.find_one({"_id": "partida_actual"})
-        turno_actual = info_partida.get("turno") if info_partida else "LIBRE"
-        paquete_turno = json.dumps({"cmd": "gmsg", "val": f"TURNO|{turno_actual}"})
-        asyncio.run_coroutine_threadsafe(ws_cliente.send(paquete_turno), loop)
-        print(f"[DB + TURNO ENVIADO] Turno actual: {turno_actual}", flush=True)
+        respuesta_unificada = "DB_ALL|" + "|".join(lista_paquetes)
+        paquete_unico = json.dumps({"cmd": "gmsg", "val": respuesta_unificada})
+        asyncio.run_coroutine_threadsafe(ws_cliente.send(paquete_unico), loop)
+        print(f"[DB UNIFICADO ENVIADO] {respuesta_unificada}", flush=True)
     except Exception as e:
         print(f"[ERROR LEYENDO DB] {e}", flush=True)
 
@@ -126,7 +125,6 @@ async def recv_con_db(self):
             cmd = paquete.get("cmd")
             loop = asyncio.get_running_loop()
 
-            # Registrar el username de CloudLink cuando el jugador se identifica (setid)
             if cmd == "setid":
                 usuarios_por_socket[self] = str(paquete.get("val", "")).strip()
 
@@ -137,12 +135,11 @@ async def recv_con_db(self):
                     threading.Thread(target=enviar_db_a_turbowarp, args=(self, loop, None)).start()
 
                 elif contenido.startswith("GET|"):
-                    usuario_buscado = contenido.split("|", 1)[1].strip()
+                    usuario_buscado = contenido.split("|", 1).strip()
                     threading.Thread(target=enviar_db_a_turbowarp, args=(self, loop, usuario_buscado)).start()
 
-                # Acepta "Pasar Turno", "PASAR_TURNO" o "PASAR_TURNO|Test"
                 elif contenido.lower().startswith("pasar turno") or contenido.upper().startswith("PASAR_TURNO"):
-                    forzado = contenido.split("|", 1)[1].strip() if "|" in contenido else None
+                    forzado = contenido.split("|", 1).strip() if "|" in contenido else None
                     remitente_user = usuarios_por_socket.get(self, "")
                     threading.Thread(target=rotar_turno, args=(remitente_user, forzado, loop)).start()
 
@@ -169,5 +166,5 @@ cl = cloudlink()
 server = cl.server(logs=False)
 
 puerto = int(os.environ.get("PORT", 8080))
-print(f"=== SERVIDOR CON ROTACION DE TURNOS LISTO EN PUERTO {puerto} ===", flush=True)
+print(f"=== SERVIDOR UNIFICADO LISTO EN PUERTO {puerto} ===", flush=True)
 server.run(ip="0.0.0.0", port=puerto)
