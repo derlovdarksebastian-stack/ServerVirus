@@ -23,8 +23,6 @@ except Exception as e:
 cache_estados = {}
 clientes_conectados = set()
 usuarios_por_socket = {}
-lock_identidades = threading.Lock()
-
 
 async def difundir_a_todos(paquete_str):
     for ws in list(clientes_conectados):
@@ -32,7 +30,6 @@ async def difundir_a_todos(paquete_str):
             await ws.send(paquete_str)
         except Exception:
             clientes_conectados.discard(ws)
-
 
 async def enviar_a_otros(remitente, paquete_str):
     for ws in list(clientes_conectados):
@@ -42,36 +39,6 @@ async def enviar_a_otros(remitente, paquete_str):
             except Exception:
                 clientes_conectados.discard(ws)
 
-
-def asociar_socket_a_usuario(socket, usuario):
-    """
-    Vincula el socket al primer usuario que envía un estado normal.
-    No permite que el mismo socket cambie después a otro usuario.
-    """
-    usuario = str(usuario).strip()
-    if not usuario:
-        return False, "nombre de jugador vacío"
-
-    with lock_identidades:
-        usuario_actual = usuarios_por_socket.get(socket)
-
-        if usuario_actual is None:
-            usuarios_por_socket[socket] = usuario
-            print(
-                f"[IDENTIDAD AUTOMATICA] Socket asociado a: {usuario}",
-                flush=True
-            )
-            return True, usuario
-
-        if usuario_actual != usuario:
-            return False, (
-                f"el socket ya pertenece a {usuario_actual} "
-                f"y no puede cambiar a {usuario}"
-            )
-
-        return True, usuario_actual
-
-
 def guardar_y_retransmitir(remitente, usuario, cartas, texto_original, loop):
     try:
         coleccion_jugadores.update_one(
@@ -80,121 +47,64 @@ def guardar_y_retransmitir(remitente, usuario, cartas, texto_original, loop):
             upsert=True
         )
         paquete_rival = json.dumps({"cmd": "gmsg", "val": texto_original})
-        asyncio.run_coroutine_threadsafe(
-            enviar_a_otros(remitente, paquete_rival), loop
-        )
+        asyncio.run_coroutine_threadsafe(enviar_a_otros(remitente, paquete_rival), loop)
     except Exception as e:
         print(f"[ERROR GUARDANDO] {e}", flush=True)
 
-
-def analizar_comando_borrar(contenido):
-    """Acepta '[331,Player] | BORRAR' y 'BORRAR | [331,Player]'."""
-    partes = [parte.strip() for parte in contenido.split("|", 1)]
-    if len(partes) != 2:
-        return None
-
-    if partes[0].upper() == "BORRAR":
-        payload = partes[1]
-    elif partes[1].upper() == "BORRAR":
-        payload = partes[0]
-    else:
-        return None
-
-    if not (payload.startswith("[") and payload.endswith("]")):
-        return None
-
-    elementos = [
-        x.strip().strip('"').strip("'")
-        for x in payload[1:-1].split(",")
-    ]
-
-    if len(elementos) != 2 or not elementos[0] or not elementos[1]:
-        return None
-
-    carta_txt, usuario = elementos
-    carta = int(carta_txt) if carta_txt.isdigit() else carta_txt
-    return carta, usuario
-
-
-def borrar_carta_y_retransmitir(remitente, usuario, carta, loop):
-    """Elimina una sola aparición de la carta y difunde el nuevo estado."""
+# NUEVA FUNCIÓN: Borrar una carta específica o todo el registro de un jugador
+def borrar_dato_jugador(usuario, carta_objetivo, loop):
     try:
-        for intento in range(5):
-            documento = coleccion_jugadores.find_one({"usuario": usuario})
+        doc = coleccion_jugadores.find_one({"usuario": usuario})
+        if not doc:
+            print(f"[BORRAR] No se encontró al jugador: {usuario}", flush=True)
+            return
 
-            if documento is None:
-                print(f"[BORRAR] Jugador inexistente en DB: {usuario}", flush=True)
-                return
+        # Caso 1: Borrar una carta en específico (ej: BORRAR|Derlo|331)
+        if carta_objetivo is not None:
+            cartas_actuales = doc.get("cartas", [])
+            valor_carta = int(carta_objetivo) if str(carta_objetivo).isdigit() else carta_objetivo
 
-            cartas_actuales = list(documento.get("cartas", []))
+            if valor_carta in cartas_actuales:
+                cartas_actuales.remove(valor_carta)  # Elimina solo una copia de esa carta
+                cache_estados[usuario] = cartas_actuales
 
-            if carta not in cartas_actuales:
-                print(
-                    f"[BORRAR] La carta {carta} no está en la mano de {usuario}",
-                    flush=True
-                )
-                return
-
-            cartas_nuevas = cartas_actuales.copy()
-            cartas_nuevas.remove(carta)
-
-            resultado = coleccion_jugadores.update_one(
-                {"usuario": usuario, "cartas": cartas_actuales},
-                {"$set": {"cartas": cartas_nuevas}}
-            )
-
-            if resultado.modified_count == 1:
-                cache_estados[usuario] = cartas_nuevas
-
-                if cartas_nuevas:
-                    cartas_txt = ",".join(str(c) for c in cartas_nuevas)
-                    estado_actualizado = f"[{cartas_txt},{usuario}]"
+                if cartas_actuales:
+                    coleccion_jugadores.update_one(
+                        {"usuario": usuario},
+                        {"$set": {"cartas": cartas_actuales}}
+                    )
+                    c_str = ",".join(str(c) for c in cartas_actuales)
+                    aviso = f"[{c_str},{usuario}]"
                 else:
-                    estado_actualizado = f"BORRAR | [{carta},{usuario}]"
+                    # Si se quedó sin cartas en mesa, borra el documento de la DB
+                    coleccion_jugadores.delete_one({"usuario": usuario})
+                    cache_estados.pop(usuario, None)
+                    aviso = f"[VACIO,{usuario}]"
 
-                paquete = json.dumps({
-                    "cmd": "gmsg",
-                    "val": estado_actualizado
-                })
+                print(f"[CARTA BORRADA] {valor_carta} de {usuario} -> Estado: {aviso}", flush=True)
+                paquete = json.dumps({"cmd": "gmsg", "val": aviso})
+                asyncio.run_coroutine_threadsafe(difundir_a_todos(paquete), loop)
+            else:
+                print(f"[BORRAR] {usuario} no tiene la carta {valor_carta}", flush=True)
 
-                asyncio.run_coroutine_threadsafe(
-                    enviar_a_otros(remitente, paquete), loop
-                )
-
-                print(
-                    f"[BORRAR OK] Carta {carta} eliminada de {usuario}. "
-                    f"Nuevo estado: {cartas_nuevas}",
-                    flush=True
-                )
-                return
-
-            print(
-                f"[BORRAR] Conflicto concurrente para {usuario}; "
-                f"reintento {intento + 1}/5",
-                flush=True
-            )
-
-        print(
-            f"[BORRAR ERROR] No se pudo actualizar la mano de {usuario} "
-            f"tras 5 intentos",
-            flush=True
-        )
+        # Caso 2: Borrar TODOS los datos de ese jugador (ej: BORRAR|Derlo)
+        else:
+            coleccion_jugadores.delete_one({"usuario": usuario})
+            cache_estados.pop(usuario, None)
+            aviso = f"[VACIO,{usuario}]"
+            print(f"[JUGADOR BORRADO DE DB] {usuario}", flush=True)
+            paquete = json.dumps({"cmd": "gmsg", "val": aviso})
+            asyncio.run_coroutine_threadsafe(difundir_a_todos(paquete), loop)
 
     except Exception as e:
-        print(f"[ERROR BORRANDO CARTA] {e}", flush=True)
-
+        print(f"[ERROR BORRANDO] {e}", flush=True)
 
 def rotar_turno(quien_pasa, jugador_forzado, loop):
     try:
         if jugador_forzado:
             siguiente = jugador_forzado
         else:
-            todos = [
-                doc["usuario"]
-                for doc in coleccion_jugadores.find({})
-                if doc.get("usuario")
-            ]
-
+            todos = [doc["usuario"] for doc in coleccion_jugadores.find({}) if doc.get("usuario")]
             if not todos:
                 siguiente = quien_pasa or "LIBRE"
             elif len(todos) == 1:
@@ -202,7 +112,6 @@ def rotar_turno(quien_pasa, jugador_forzado, loop):
             else:
                 info = coleccion_partida.find_one({"_id": "partida_actual"})
                 actual = info.get("turno") if info else quien_pasa
-
                 if actual in todos:
                     idx = (todos.index(actual) + 1) % len(todos)
                     siguiente = todos[idx]
@@ -214,66 +123,46 @@ def rotar_turno(quien_pasa, jugador_forzado, loop):
             {"$set": {"turno": siguiente}},
             upsert=True
         )
-
         print(f"[TURNO GUARDADO EN DB] Ahora juega: {siguiente}", flush=True)
-        paquete_turno = json.dumps({
-            "cmd": "gmsg",
-            "val": f"TURNO|{siguiente}"
-        })
-        asyncio.run_coroutine_threadsafe(
-            difundir_a_todos(paquete_turno), loop
-        )
-
+        paquete_turno = json.dumps({"cmd": "gmsg", "val": f"TURNO|{siguiente}"})
+        asyncio.run_coroutine_threadsafe(difundir_a_todos(paquete_turno), loop)
     except Exception as e:
         print(f"[ERROR TURNO] {e}", flush=True)
-
 
 def enviar_db_a_turbowarp(ws_cliente, loop, filtro_usuario=None):
     try:
         consulta = {"usuario": filtro_usuario} if filtro_usuario else {}
         documentos = list(coleccion_jugadores.find(consulta))
-
+        
         info_partida = coleccion_partida.find_one({"_id": "partida_actual"})
         turno_actual = info_partida.get("turno") if info_partida else "LIBRE"
-
+        
         lista_paquetes = [f"TURNO:{turno_actual}"]
 
         for doc in documentos:
             u = doc.get("usuario", "")
             c_list = doc.get("cartas", [])
-
             if u and c_list:
                 cache_estados[u] = c_list
                 c_str = ",".join(str(c) for c in c_list)
                 lista_paquetes.append(f"[{c_str},{u}]")
 
         respuesta_unificada = "DB_ALL|" + "|".join(lista_paquetes)
-        paquete_unico = json.dumps({
-            "cmd": "gmsg",
-            "val": respuesta_unificada
-        })
-
-        asyncio.run_coroutine_threadsafe(
-            ws_cliente.send(paquete_unico), loop
-        )
+        paquete_unico = json.dumps({"cmd": "gmsg", "val": respuesta_unificada})
+        asyncio.run_coroutine_threadsafe(ws_cliente.send(paquete_unico), loop)
         print(f"[DB UNIFICADO ENVIADO] {respuesta_unificada}", flush=True)
-
     except Exception as e:
         print(f"[ERROR LEYENDO DB] {e}", flush=True)
 
-
 recv_original = websockets.legacy.server.WebSocketServerProtocol.recv
-
 
 async def recv_con_db(self):
     clientes_conectados.add(self)
-
     try:
         mensaje = await recv_original(self)
     except Exception:
         clientes_conectados.discard(self)
-        with lock_identidades:
-            usuarios_por_socket.pop(self, None)
+        usuarios_por_socket.pop(self, None)
         raise
 
     if isinstance(mensaje, str):
@@ -283,150 +172,57 @@ async def recv_con_db(self):
             val = paquete.get("val")
             loop = asyncio.get_running_loop()
 
-            # Compatibilidad opcional: setid sigue funcionando si algún cliente
-            # antiguo lo envía, pero ya no es obligatorio.
             if cmd == "setid":
-                usuario_setid = str(val or "").strip()
-                if usuario_setid:
-                    ok, resultado = asociar_socket_a_usuario(self, usuario_setid)
-                    if ok:
-                        print(
-                            f"[SETID COMPATIBLE] Usuario: {resultado}",
-                            flush=True
-                        )
-                    else:
-                        print(
-                            f"[SETID RECHAZADO] {resultado}",
-                            flush=True
-                        )
+                usuarios_por_socket[self] = str(val).strip()
+                print(f"[CONECTADO] Usuario: {usuarios_por_socket[self]}", flush=True)
 
             elif val is not None and "turno" in str(val).lower():
                 contenido = str(val).strip()
-                print(
-                    f"[DETECTADO TURNO] cmd={cmd} | val={contenido}",
-                    flush=True
-                )
-                forzado = (
-                    contenido.split("|", 1)[1].strip()
-                    if "|" in contenido else None
-                )
+                print(f"[DETECTADO TURNO] cmd={cmd} | val={contenido}", flush=True)
+                forzado = contenido.split("|", 1)[1].strip() if "|" in contenido else None
                 remitente_user = usuarios_por_socket.get(self, "")
-                threading.Thread(
-                    target=rotar_turno,
-                    args=(remitente_user, forzado, loop),
-                    daemon=True
-                ).start()
+                threading.Thread(target=rotar_turno, args=(remitente_user, forzado, loop)).start()
 
             elif cmd in ["gmsg", "gvar"]:
                 contenido = str(val or "").strip()
 
                 if contenido == "GET_DB":
-                    threading.Thread(
-                        target=enviar_db_a_turbowarp,
-                        args=(self, loop, None),
-                        daemon=True
-                    ).start()
+                    threading.Thread(target=enviar_db_a_turbowarp, args=(self, loop, None)).start()
 
                 elif contenido.startswith("GET|"):
                     usuario_buscado = contenido.split("|", 1)[1].strip()
-                    threading.Thread(
-                        target=enviar_db_a_turbowarp,
-                        args=(self, loop, usuario_buscado),
-                        daemon=True
-                    ).start()
+                    threading.Thread(target=enviar_db_a_turbowarp, args=(self, loop, usuario_buscado)).start()
 
-                elif "BORRAR" in contenido.upper():
-                    solicitud = analizar_comando_borrar(contenido)
-
-                    if solicitud is None:
-                        print(
-                            f"[BORRAR FORMATO INVALIDO] Recibido: {contenido}",
-                            flush=True
-                        )
-                    else:
-                        carta, usuario_objetivo = solicitud
-                        usuario_autenticado = usuarios_por_socket.get(self)
-
-                        if not usuario_autenticado:
-                            print(
-                                "[BORRAR RECHAZADO] Este socket todavía no "
-                                "ha enviado su estado normal de cartas. "
-                                "Primero debe enviar [cartas,Jugador]. "
-                                f"Comando recibido: {contenido}",
-                                flush=True
-                            )
-                        elif usuario_autenticado != usuario_objetivo:
-                            print(
-                                f"[BORRAR RECHAZADO] Socket de "
-                                f"{usuario_autenticado} intentó modificar "
-                                f"a {usuario_objetivo}",
-                                flush=True
-                            )
-                        else:
-                            threading.Thread(
-                                target=borrar_carta_y_retransmitir,
-                                args=(
-                                    self,
-                                    usuario_objetivo,
-                                    carta,
-                                    loop
-                                ),
-                                daemon=True
-                            ).start()
+                # COMANDO BORRAR: "BORRAR|Derlo|331" o "BORRAR|Derlo"
+                elif contenido.upper().startswith("BORRAR|"):
+                    partes = [p.strip() for p in contenido.split("|")]
+                    if len(partes) >= 2 and partes[1]:
+                        usuario_objetivo = partes[1]
+                        carta_objetivo = partes[2] if len(partes) >= 3 and partes[2] else None
+                        threading.Thread(
+                            target=borrar_dato_jugador,
+                            args=(usuario_objetivo, carta_objetivo, loop)
+                        ).start()
 
                 elif contenido.startswith("[") and contenido.endswith("]"):
-                    elementos = [
-                        x.strip().strip('"').strip("'")
-                        for x in contenido[1:-1].split(",")
-                        if x.strip()
-                    ]
-
+                    elementos = [x.strip().strip('"').strip("'") for x in contenido[1:-1].split(",") if x.strip()]
                     if len(elementos) >= 2:
                         usuario = elementos[-1]
-                        ok, resultado = asociar_socket_a_usuario(
-                            self, usuario
-                        )
-
-                        if not ok:
-                            print(
-                                f"[IDENTIDAD RECHAZADA] {resultado}. "
-                                f"Paquete: {contenido}",
-                                flush=True
-                            )
-                        else:
-                            cartas = [
-                                int(c) if c.isdigit() else c
-                                for c in elementos[:-1]
-                            ]
-
-                            if cache_estados.get(usuario) != cartas:
-                                cache_estados[usuario] = cartas
-                                threading.Thread(
-                                    target=guardar_y_retransmitir,
-                                    args=(
-                                        self,
-                                        usuario,
-                                        cartas,
-                                        contenido,
-                                        loop
-                                    ),
-                                    daemon=True
-                                ).start()
-
+                        usuarios_por_socket[self] = usuario
+                        cartas = [int(c) if c.isdigit() else c for c in elementos[:-1]]
+                        if cache_estados.get(usuario) != cartas:
+                            cache_estados[usuario] = cartas
+                            threading.Thread(
+                                target=guardar_y_retransmitir,
+                                args=(self, usuario, cartas, contenido, loop)
+                            ).start()
         except Exception as e:
             print(f"[ERROR PARSE] {e}", flush=True)
-
     return mensaje
-
 
 websockets.legacy.server.WebSocketServerProtocol.recv = recv_con_db
 
-logging.basicConfig(
-    level=logging.ERROR,
-    stream=sys.stdout,
-    force=True
-)
-
+logging.basicConfig(level=logging.ERROR, stream=sys.stdout, force=True)
 cl = cloudlink()
 server = cl.server(logs=False)
 
