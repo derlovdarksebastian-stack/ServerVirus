@@ -51,6 +51,112 @@ def guardar_y_retransmitir(remitente, usuario, cartas, texto_original, loop):
     except Exception as e:
         print(f"[ERROR GUARDANDO] {e}", flush=True)
 
+
+def analizar_comando_borrar(contenido):
+    """Acepta '[331,Player] | BORRAR' y 'BORRAR | [331,Player]'."""
+    partes = [parte.strip() for parte in contenido.split("|", 1)]
+    if len(partes) != 2:
+        return None
+
+    if partes[0].upper() == "BORRAR":
+        payload = partes[1]
+    elif partes[1].upper() == "BORRAR":
+        payload = partes[0]
+    else:
+        return None
+
+    if not (payload.startswith("[") and payload.endswith("]")):
+        return None
+
+    elementos = [x.strip().strip('"').strip("'")
+                 for x in payload[1:-1].split(",")]
+
+    # El comando BORRAR identifica exactamente una carta y un jugador.
+    if len(elementos) != 2 or not elementos[0] or not elementos[1]:
+        return None
+
+    carta_txt, usuario = elementos
+    carta = int(carta_txt) if carta_txt.isdigit() else carta_txt
+    return carta, usuario
+
+
+def borrar_carta_y_retransmitir(remitente, usuario, carta, loop):
+    """Elimina una sola aparición de la carta y difunde el cambio."""
+    try:
+        # Reintento optimista: evita sobrescribir una actualización concurrente.
+        for intento in range(5):
+            documento = coleccion_jugadores.find_one({"usuario": usuario})
+
+            if documento is None:
+                print(f"[BORRAR] Jugador inexistente: {usuario}", flush=True)
+                return
+
+            cartas_actuales = list(documento.get("cartas", []))
+
+            if carta not in cartas_actuales:
+                print(
+                    f"[BORRAR] La carta {carta} no está en la mano de {usuario}",
+                    flush=True
+                )
+                return
+
+            cartas_nuevas = cartas_actuales.copy()
+            cartas_nuevas.remove(carta)  # Elimina solo la primera aparición.
+
+            resultado = coleccion_jugadores.update_one(
+                {
+                    "usuario": usuario,
+                    "cartas": cartas_actuales
+                },
+                {
+                    "$set": {"cartas": cartas_nuevas}
+                }
+            )
+
+            if resultado.modified_count == 1:
+                cache_estados[usuario] = cartas_nuevas
+
+                if cartas_nuevas:
+                    cartas_txt = ",".join(str(c) for c in cartas_nuevas)
+                    estado_actualizado = f"[{cartas_txt},{usuario}]"
+                else:
+                    # El formato antiguo [cartas,usuario] no representa
+                    # inequívocamente una mano vacía. Se difunde el evento
+                    # para que el cliente pueda aplicar la eliminación.
+                    estado_actualizado = f"BORRAR | [{carta},{usuario}]"
+
+                paquete = json.dumps({
+                    "cmd": "gmsg",
+                    "val": estado_actualizado
+                })
+                asyncio.run_coroutine_threadsafe(
+                    enviar_a_otros(remitente, paquete),
+                    loop
+                )
+
+                print(
+                    f"[BORRAR OK] Una aparición de {carta} eliminada de "
+                    f"{usuario}. Nuevo estado: {cartas_nuevas}",
+                    flush=True
+                )
+                return
+
+            print(
+                f"[BORRAR] Conflicto concurrente para {usuario}; "
+                f"reintentando ({intento + 1}/5)",
+                flush=True
+            )
+
+        print(
+            f"[BORRAR ERROR] No se pudo actualizar la mano de {usuario} "
+            f"tras 5 intentos",
+            flush=True
+        )
+
+    except Exception as e:
+        print(f"[ERROR BORRANDO CARTA] {e}", flush=True)
+
+
 def rotar_turno(quien_pasa, jugador_forzado, loop):
     try:
         if jugador_forzado:
@@ -145,6 +251,34 @@ async def recv_con_db(self):
                 elif contenido.startswith("GET|"):
                     usuario_buscado = contenido.split("|", 1)[1].strip()
                     threading.Thread(target=enviar_db_a_turbowarp, args=(self, loop, usuario_buscado)).start()
+
+                elif "BORRAR" in contenido.upper():
+                    solicitud = analizar_comando_borrar(contenido)
+
+                    if solicitud is None:
+                        print(f"[BORRAR] Formato inválido: {contenido}", flush=True)
+                    else:
+                        carta, usuario_objetivo = solicitud
+                        usuario_autenticado = usuarios_por_socket.get(self)
+
+                        # El socket debe haberse identificado previamente con setid
+                        # y solo puede modificar las cartas de ese mismo usuario.
+                        if not usuario_autenticado:
+                            print(
+                                f"[BORRAR RECHAZADO] Socket sin setid: {contenido}",
+                                flush=True
+                            )
+                        elif usuario_autenticado != usuario_objetivo:
+                            print(
+                                f"[BORRAR RECHAZADO] {usuario_autenticado} "
+                                f"intentó modificar a {usuario_objetivo}",
+                                flush=True
+                            )
+                        else:
+                            threading.Thread(
+                                target=borrar_carta_y_retransmitir,
+                                args=(self, usuario_objetivo, carta, loop)
+                            ).start()
 
                 elif contenido.startswith("[") and contenido.endswith("]"):
                     elementos = [x.strip().strip('"').strip("'") for x in contenido[1:-1].split(",") if x.strip()]
