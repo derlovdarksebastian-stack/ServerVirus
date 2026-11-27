@@ -39,15 +39,35 @@ async def enviar_a_otros(remitente, paquete_str):
             except Exception:
                 clientes_conectados.discard(ws)
 
-def guardar_y_retransmitir(remitente, usuario, cartas, texto_original, loop):
+def guardar_y_retransmitir(remitente, usuario, cartas, texto_original, loop): #4.7.1 Pre alpha
     try:
+        # 1. Guarda en MongoDB
         coleccion_jugadores.update_one(
             {"usuario": usuario},
             {"$set": {"usuario": usuario, "cartas": cartas}},
             upsert=True
         )
-        paquete_rival = json.dumps({"cmd": "gmsg", "val": texto_original})
-        asyncio.run_coroutine_threadsafe(enviar_a_otros(remitente, paquete_rival), loop)
+        
+        # 2. Arma el DB_ALL actualizado con TODOS los jugadores y el turno
+        documentos = list(coleccion_jugadores.find({}))
+        info_partida = coleccion_partida.find_one({"_id": "partida_actual"})
+        turno_actual = info_partida.get("turno") if info_partida else "LIBRE"
+        
+        lista_paquetes = [f"TURNO:{turno_actual}"]
+        for doc in documentos:
+            u = doc.get("usuario", "")
+            c_list = doc.get("cartas", [])
+            if u and c_list:
+                cache_estados[u] = c_list
+                c_str = ",".join(str(c) for c in c_list)
+                lista_paquetes.append(f"[{c_str},{u}]")
+
+        respuesta_unificada = "DB_ALL|" + "|".join(lista_paquetes)
+        paquete_todos = json.dumps({"cmd": "gmsg", "val": respuesta_unificada})
+        
+        # 3. Lo difunde a TODOS los conectados al instante
+        asyncio.run_coroutine_threadsafe(difundir_a_todos(paquete_todos), loop)
+        print(f"[SINCRONIZADO A TODOS] {respuesta_unificada}", flush=True)
     except Exception as e:
         print(f"[ERROR GUARDANDO] {e}", flush=True)
 
@@ -210,8 +230,7 @@ async def recv_con_db(self):
                         usuario = elementos[-1]
                         usuarios_por_socket[self] = usuario
                         cartas = [int(c) if c.isdigit() else c for c in elementos[:-1]]
-                        if cache_estados.get(usuario) != cartas:
-                            cache_estados[usuario] = cartas
+                        cache_estados[usuario] = cartas
                             threading.Thread(
                                 target=guardar_y_retransmitir,
                                 args=(self, usuario, cartas, contenido, loop)
