@@ -226,15 +226,15 @@ async def recv_con_db(self):
 
                 elif contenido.startswith("[") and contenido.endswith("]"):
                     elementos = [x.strip().strip('"').strip("'") for x in contenido[1:-1].split(",") if x.strip()]
-                    if len(elementos) >= 2:
-                        usuario = elementos[-1]
-                        usuarios_por_socket[self] = usuario
-                        cartas = [int(c) if c.isdigit() else c for c in elementos[:-1]]
-                        cache_estados[usuario] = cartas
-                            threading.Thread(
-                                target=guardar_y_retransmitir,
-                                args=(self, usuario, cartas, contenido, loop)
-                            ).start()
+                if len(elementos) >= 2:
+                    usuario = elementos[-1]
+                    usuarios_por_socket[self] = usuario
+                    cartas = [int(c) if c.isdigit() else c for c in elementos[:-1]]
+                    cache_estados[usuario] = cartas
+                    threading.Thread(
+                        target=guardar_y_retransmitir,
+                        args=(self, usuario, cartas, contenido, loop)
+                    ).start()
         except Exception as e:
             print(f"[ERROR PARSE] {e}", flush=True)
     return mensaje
